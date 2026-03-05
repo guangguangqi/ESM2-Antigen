@@ -1,0 +1,62 @@
+import torch
+import torch.nn as nn
+from transformers import EsmModel, EsmConfig
+
+# 1. Antigen Geometric Encoder (Simplified SE(3) GNN logic)
+class AntigenGeometryEncoder(nn.Module):
+    def __init__(self, node_feat_dim, hidden_dim):
+        super().__init__()
+        # In practice, use e3nn.o3.TensorProduct or EGNN layers
+        self.gnn_layer = nn.Linear(node_feat_dim, hidden_dim) 
+        
+    def forward(self, pos, node_feats):
+        # pos: [Batch, N_atoms, 3] - Coordinate info
+        # node_feats: [Batch, N_atoms, Dim] - Atom types/Chemical props
+        # SE(3) invariance logic: use relative distances ||pi - pj||
+        dist_matrix = torch.cdist(pos, pos) 
+        # Simplified: Map geometric features to embedding space
+        geo_context = self.gnn_layer(node_feats) 
+        return geo_context  # [Batch, N_atoms, hidden_dim]
+
+# 2. Hybrid Antibody Generator
+class GeometryAwareCDRGenerator(nn.Module):
+    def __init__(self, esm_model_name="facebook/esm2_t6_8M_UR50D"):
+        super().__init__()
+        # Sequence Expert: Pre-trained ESM2
+        self.esm_encoder = EsmModel.from_pretrained(esm_model_name)
+        hidden_dim = self.esm_encoder.config.hidden_size
+        
+        # Structure Expert: SE(3) GNN
+        self.antigen_encoder = AntigenGeometryEncoder(node_feat_dim=128, hidden_dim=hidden_dim)
+        
+        # Integration: Cross-Attention Decoder
+        # It takes CDR tokens and "looks" at the Antigen Geometry
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=hidden_dim, nhead=8, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=3)
+        
+        self.output_head = nn.Linear(hidden_dim, 33) # 33 amino acid tokens
+
+    def forward(self, antibody_seq_ids, antigen_pos, antigen_feats):
+        # A. Encode Antibody Sequence Context (ESM2)
+        # We mask the CDR regions we want to generate
+        seq_embeddings = self.esm_encoder(antibody_seq_ids).last_hidden_state
+        
+        # B. Encode Antigen Geometry (SE(3) GNN)
+        geo_embeddings = self.antigen_encoder(antigen_pos, antigen_feats)
+        
+        # C. Cross-Attention Generation (The "Matching" Step)
+        # Target: Antibody features, Memory: Antigen geometry
+        # This allows the model to "see" the 3D surface while picking AAs
+        output = self.decoder(
+            tgt=seq_embeddings,      # Sequence "Linguistics"
+            memory=geo_embeddings    # Geometric "Lock"
+        )
+        
+        return self.output_head(output)
+
+# Example Usage
+# model = GeometryAwareCDRGenerator()
+# logits = model(antibody_ids, ant_coords, ant_chemical_feats)
+Use code with caution.
