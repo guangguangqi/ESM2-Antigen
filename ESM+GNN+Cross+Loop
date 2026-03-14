@@ -1,0 +1,596 @@
+#################End-to_end, update with google AI
+import torch
+import torch.nn as nn
+from transformers import EsmModel, AutoTokenizer
+from torch.utils.data import Dataset, DataLoader, random_split
+
+############################################################
+# 1. Model: AntibodyGenerator
+############################################################
+
+class AntibodyGenerator(nn.Module):
+    def __init__(self, esm_model_name="facebook/esm2_t6_8M_UR50D", freeze_layers=2):
+        super().__init__()
+        
+        # Load Pre-trained ESM-2
+        self.esm = EsmModel.from_pretrained(esm_model_name)
+        self.embed_dim = self.esm.config.hidden_size # 320 for 8M model
+
+        # OPTIMIZATION: Freeze early ESM layers to speed up inner-loop training
+        if freeze_layers > 0:
+            for param in self.esm.embeddings.parameters():
+                param.requires_grad = False
+            for layer in self.esm.encoder.layer[:freeze_layers]:
+                for param in layer.parameters():
+                    param.requires_grad = False
+
+        # Structural GNN (Antigen Surface Mapping)
+        self.antigen_gnn = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim)
+        )
+
+        # Cross-Attention (Binding Alignment)
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim, num_heads=8, batch_first=True
+        )
+
+        # Autoregressive Decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.embed_dim, nhead=8, batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
+
+        # Vocabulary Head (ESM-2 standard is 33 tokens)
+        self.fc_out = nn.Linear(self.embed_dim, 33)
+
+    def generate_causal_mask(self, sz, device):
+        """
+        FIXED: Creates a lower-triangular mask. 
+        Positions with -inf are ignored, ensuring the model cannot 'see' the future.
+        """
+        mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        return mask
+
+    def forward(self, ab_tokens, ag_tokens, ag_adj, target_tokens):
+        # 1. Feature Extraction
+        ab_feats = self.esm(ab_tokens).last_hidden_state
+        ag_feats = self.esm(ag_tokens).last_hidden_state
+
+        # 2. Structural Integration
+        ag_struct_feats = torch.matmul(ag_adj, ag_feats)
+        ag_context = self.antigen_gnn(ag_struct_feats)
+
+        # 3. Cross-Attention
+        interacted_feats, _ = self.cross_attention(
+            query=ab_feats, key=ag_context, value=ag_context
+        )
+
+        # 4. Decoding with Causal Masking
+        tgt_emb = self.esm.embeddings.word_embeddings(target_tokens)
+        sz = target_tokens.size(1)
+        mask = self.generate_causal_mask(sz, target_tokens.device)
+
+        output = self.decoder(
+            tgt=tgt_emb, 
+            memory=interacted_feats, 
+            tgt_mask=mask
+        )
+
+        return self.fc_out(output)
+
+############################################################
+# 2. Dataset & Collate (Data Handling)
+############################################################
+
+class AntibodyDataset(Dataset):
+    def __init__(self, database):
+        self.database = database # List of (ab_seq, ag_seq, ag_adj, target_seq)
+
+    def __len__(self):
+        return len(self.database)
+
+    def __getitem__(self, idx):
+        return self.database[idx]
+
+def collate_fn(batch):
+    ab_seqs, ag_seqs, ag_adjs, target_seqs = zip(*batch)
+
+    # Tokenize sequences
+    ab_tokens = tokenizer(ab_seqs, return_tensors="pt", padding=True).input_ids
+    ag_tokens = tokenizer(ag_seqs, return_tensors="pt", padding=True).input_ids
+    target_tokens = tokenizer(target_seqs, return_tensors="pt", padding=True).input_ids
+
+    # Pad Adjacency Matrices to match max antigen length in this batch
+    max_ag_len = ag_tokens.shape[1]
+    padded_adj = []
+    for adj in ag_adjs:
+        pad = torch.zeros(max_ag_len, max_ag_len)
+        pad[:adj.shape[0], :adj.shape[1]] = adj
+        padded_adj.append(pad)
+    
+    return ab_tokens, ag_tokens, torch.stack(padded_adj), target_tokens
+
+############################################################
+# 3. Training/Validation Loop (The Inner Loop)
+############################################################
+
+def train_one_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for ab_tokens, ag_tokens, ag_adj, target_tokens in loader:
+        ab_tokens, ag_tokens, ag_adj, target_tokens = [t.to(device) for t in [ab_tokens, ag_tokens, ag_adj, target_tokens]]
+
+        optimizer.zero_grad()
+
+        # Teacher Forcing: Shift tokens
+        tgt_input = target_tokens[:, :-1]
+        tgt_labels = target_tokens[:, 1:]
+
+        logits = model(ab_tokens, ag_tokens, ag_adj, tgt_input)
+        
+        # Loss calculation (flattening B x L x V to (B*L) x V)
+        loss = criterion(logits.reshape(-1, 33), tgt_labels.reshape(-1))
+        
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(loader)
+
+############################################################
+# 4. Initialization & Main Run
+############################################################
+
+# Set up environment
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+tokenizer = AutoTokenizer.from_pretrained("facebook/esm2_t6_8M_UR50D")
+model = AntibodyGenerator().to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+
+# Mock Data Generation (Replace with your actual database)
+mock_db = []
+for _ in range(50):
+    seq = "EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQ"
+    ag_s = "MGYALNCVWES"
+    # Adjacency size must match tokenized length (includes <cls> and <eos>)
+    adj_size = len(tokenizer(ag_s).input_ids) 
+    mock_db.append((seq, ag_s, torch.eye(adj_size), seq))
+
+# Dataloaders
+full_dataset = AntibodyDataset(mock_db)
+train_set, val_set = random_split(full_dataset, [40, 10])
+train_loader = DataLoader(train_set, batch_size=4, shuffle=True, collate_fn=collate_fn)
+
+# Start Inner Loop
+for epoch in range(5):
+    avg_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+    print(f"Epoch {epoch} | Loss: {avg_loss:.4f}")
+
+#############################################
+import numpy as np
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
+
+############################################################
+# 5. Inference: Generate New Sequences
+############################################################
+
+def generate_candidates(model, ag_seq, ag_adj, num_samples=10, max_len=40):
+    model.eval()
+    candidates = []
+    
+    # Pre-process Antigen
+    ag_tokens = tokenizer(ag_seq, return_tensors="pt").input_ids.to(device)
+    ag_adj = ag_adj.to(device).unsqueeze(0) # Add batch dim
+
+    with torch.no_grad():
+        for _ in range(num_samples):
+            # Start with <cls> token
+            generated = torch.tensor([[tokenizer.cls_token_id]], device=device)
+            
+            for _ in range(max_len):
+                # We use a dummy ab_seq for context, or a 'seed' framework
+                dummy_ab = torch.zeros_like(ag_tokens) 
+                
+                logits = model(dummy_ab, ag_tokens, ag_adj, generated)
+                next_token_logits = logits[:, -1, :]
+                
+                # Sample using Temperature (0.8 = creative, 0.1 = strict)
+                probs = torch.softmax(next_token_logits / 0.8, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+                generated = torch.cat((generated, next_token), dim=1)
+                
+                if next_token.item() == tokenizer.eos_token_id:
+                    break
+            
+            candidates.append(tokenizer.decode(generated[0], skip_special_tokens=True))
+    return list(set(candidates)) # Return unique sequences
+
+############################################################
+# 6. The Outer Loop (Active Learning / Bayesian)
+############################################################
+
+def active_learning_outer_loop(database, num_rounds=5):
+    # 1. Initialize Bayesian Surrogate (GP is common for small data)
+    kernel = C(1.0, (1e-3, 1e3)) * RBF(10, (1e-2, 1e2))
+    surrogate = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=9)
+
+    for round_idx in range(num_rounds):
+        print(f"\n--- OUTER LOOP ROUND {round_idx} ---")
+
+        # STEP A: Train the Generative Model (The Inner Loop)
+        # In a real run, you'd call 'train_one_epoch' for ~50 epochs here
+        print("Retraining Generative Model on current database...")
+        # (Inner Loop Logic goes here)
+
+        # STEP B: Generate Novel Candidates
+        target_antigen = "MGYALNCVWES" # Our target
+        target_adj = torch.eye(len(tokenizer(target_antigen).input_ids))
+        raw_candidates = generate_candidates(model, target_antigen, target_adj, num_samples=50)
+
+        # STEP C: Bayesian Selection (Acquisition)
+        # We need to convert sequences to fixed-length vectors for the GP
+        # Use ESM-2 to get a single embedding per candidate
+        candidate_embeddings = []
+        for c in raw_candidates:
+            tokens = tokenizer(c, return_tensors="pt").input_ids.to(device)
+            with torch.no_grad():
+                emb = model.esm(tokens).last_hidden_state.mean(dim=1).cpu().numpy()
+            candidate_embeddings.append(emb.flatten())
+        
+        # Predict Affinity + Uncertainty (Standard Deviation)
+        # Note: In Round 0, surrogate needs 'fit' on initial database first
+        # pred_mean, pred_std = surrogate.predict(candidate_embeddings, return_std=True)
+        
+        # Acquisition Function: Upper Confidence Bound (UCB)
+        # score = pred_mean + 1.96 * pred_std 
+        
+        # STEP D: "Wet Lab" Simulation (The Oracle)
+        # In reality, you send these to the lab. Here, we simulate a 'score'.
+        print(f"Testing {len(raw_candidates)} candidates in the lab...")
+        new_data_points = []
+        for seq in raw_candidates[:5]: # Pick top 5 based on UCB score
+            simulated_affinity = np.random.rand() # Mock result
+            new_data_points.append((seq, target_antigen, target_adj, seq))
+            print(f"  New binder found: {seq[:10]}... Score: {simulated_affinity:.2f}")
+
+        # STEP E: Update Database
+        database.extend(new_data_points)
+        print(f"Database expanded. Total samples: {len(database)}")
+
+# To start the whole process:
+# active_learning_outer_loop(mock_db)
+
+
+
+
+
+####################################### another version with chatgpt #############################
+
+import torch
+import torch.nn as nn
+from transformers import EsmModel, AutoTokenizer
+from torch.utils.data import Dataset, DataLoader, random_split
+
+############################################################
+# Model
+############################################################
+
+class AntibodyGenerator(nn.Module):
+    def __init__(self, esm_model_name="facebook/esm2_t6_8M_UR50D"):
+        super().__init__()
+
+        self.esm = EsmModel.from_pretrained(esm_model_name)
+        self.embed_dim = self.esm.config.hidden_size
+
+        self.antigen_gnn = nn.Sequential(
+            nn.Linear(self.embed_dim, self.embed_dim),
+            nn.ReLU(),
+            nn.Linear(self.embed_dim, self.embed_dim)
+        )
+
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.embed_dim, num_heads=8, batch_first=True
+        )
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=self.embed_dim, nhead=8, batch_first=True
+        )
+
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
+
+        self.fc_out = nn.Linear(self.embed_dim, 33)
+
+    def generate_causal_mask(self, sz, device):
+
+        mask = torch.triu(torch.ones(sz, sz, device=device))
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        mask = mask.masked_fill(mask == 0, float(0.0))
+        return mask
+
+    def forward(self, ab_tokens, ag_tokens, ag_adj, target_tokens):
+
+        ab_feats = self.esm(ab_tokens).last_hidden_state
+
+        ag_feats = self.esm(ag_tokens).last_hidden_state
+
+        ag_struct_feats = torch.matmul(ag_adj, ag_feats)
+
+        ag_context = self.antigen_gnn(ag_struct_feats)
+
+        interacted_feats, _ = self.cross_attention(
+            ab_feats, ag_context, ag_context
+        )
+
+        tgt_emb = self.esm.embeddings.word_embeddings(target_tokens)
+
+        sz = target_tokens.size(1)
+        mask = self.generate_causal_mask(sz, target_tokens.device)
+
+        output = self.decoder(
+            tgt=tgt_emb,
+            memory=interacted_feats,
+            tgt_mask=mask
+        )
+
+        return self.fc_out(output)
+
+############################################################
+# Dataset
+############################################################
+
+class AntibodyDataset(Dataset):
+
+    def __init__(self, database):
+        self.database = database
+
+    def __len__(self):
+        return len(self.database)
+
+    def __getitem__(self, idx):
+
+        ab_seq, ag_seq, ag_adj, target_seq = self.database[idx]
+
+        return ab_seq, ag_seq, ag_adj, target_seq
+
+############################################################
+# Collate function (handles batch tokenization)
+############################################################
+
+def collate_fn(batch):
+
+    ab_seqs = [x[0] for x in batch]
+    ag_seqs = [x[1] for x in batch]
+    ag_adj = [x[2] for x in batch]
+    target_seqs = [x[3] for x in batch]
+
+    ab_tokens = tokenizer(
+        ab_seqs,
+        return_tensors="pt",
+        padding=True
+    ).input_ids
+
+    ag_tokens = tokenizer(
+        ag_seqs,
+        return_tensors="pt",
+        padding=True
+    ).input_ids
+
+    target_tokens = tokenizer(
+        target_seqs,
+        return_tensors="pt",
+        padding=True
+    ).input_ids
+
+    max_len = ag_tokens.shape[1]
+
+    padded_adj = []
+
+    for adj in ag_adj:
+
+        pad = torch.zeros(max_len, max_len)
+        pad[:adj.shape[0], :adj.shape[1]] = adj
+        padded_adj.append(pad)
+
+    ag_adj = torch.stack(padded_adj)
+
+    return ab_tokens, ag_tokens, ag_adj, target_tokens
+
+############################################################
+# Initialize
+############################################################
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+tokenizer = AutoTokenizer.from_pretrained(
+    "facebook/esm2_t6_8M_UR50D"
+)
+
+model = AntibodyGenerator().to(device)
+
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=1e-4
+)
+
+criterion = nn.CrossEntropyLoss(
+    ignore_index=tokenizer.pad_token_id
+)
+
+############################################################
+# Mock Database
+############################################################
+
+database = []
+
+for _ in range(200):
+
+    ab_seq = "EVQLVESGGGLVQPGGSLRLSCAASGFTFSSYAMSWVRQ"
+    ag_seq = "MGYALNCVWES"
+
+    ag_token_len = len(tokenizer(ag_seq).input_ids)
+
+    ag_adj = torch.eye(ag_token_len)
+
+    target_seq = ab_seq
+
+    database.append((ab_seq, ag_seq, ag_adj, target_seq))
+
+dataset = AntibodyDataset(database)
+
+############################################################
+# Train / Validation Split
+############################################################
+
+train_size = int(0.9 * len(dataset))
+val_size = len(dataset) - train_size
+
+train_dataset, val_dataset = random_split(
+    dataset,
+    [train_size, val_size]
+)
+
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=8,
+    shuffle=True,
+    collate_fn=collate_fn
+)
+
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=8,
+    collate_fn=collate_fn
+)
+
+############################################################
+# Training
+############################################################
+
+def train_one_epoch():
+
+    model.train()
+
+    total_loss = 0
+
+    for ab_tokens, ag_tokens, ag_adj, target_tokens in train_loader:
+
+        ab_tokens = ab_tokens.to(device)
+        ag_tokens = ag_tokens.to(device)
+        ag_adj = ag_adj.to(device)
+        target_tokens = target_tokens.to(device)
+
+        optimizer.zero_grad()
+
+        tgt_input = target_tokens[:, :-1]
+        tgt_labels = target_tokens[:, 1:]
+
+        logits = model(
+            ab_tokens,
+            ag_tokens,
+            ag_adj,
+            tgt_input
+        )
+
+        loss = criterion(
+            logits.reshape(-1, 33),
+            tgt_labels.reshape(-1)
+        )
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(train_loader)
+
+
+############################################################
+# Validation
+############################################################
+
+def validate():
+
+    model.eval()
+
+    total_loss = 0
+
+    with torch.no_grad():
+
+        for ab_tokens, ag_tokens, ag_adj, target_tokens in val_loader:
+
+            ab_tokens = ab_tokens.to(device)
+            ag_tokens = ag_tokens.to(device)
+            ag_adj = ag_adj.to(device)
+            target_tokens = target_tokens.to(device)
+
+            tgt_input = target_tokens[:, :-1]
+            tgt_labels = target_tokens[:, 1:]
+
+            logits = model(
+                ab_tokens,
+                ag_tokens,
+                ag_adj,
+                tgt_input
+            )
+
+            loss = criterion(
+                logits.reshape(-1, 33),
+                tgt_labels.reshape(-1)
+            )
+
+            total_loss += loss.item()
+
+    return total_loss / len(val_loader)
+
+############################################################
+# Main Training Loop
+############################################################
+
+max_epochs = 50
+best_val_loss = float("inf")
+
+patience = 5
+counter = 0
+
+for epoch in range(max_epochs):
+
+    train_loss = train_one_epoch()
+
+    val_loss = validate()
+
+    print(
+        f"Epoch {epoch} | Train Loss {train_loss:.4f} | Val Loss {val_loss:.4f}"
+    )
+
+    if val_loss < best_val_loss:
+
+        best_val_loss = val_loss
+
+        counter = 0
+
+        torch.save(
+            model.state_dict(),
+            "best_antibody_model.pt"
+        )
+
+    else:
+
+        counter += 1
+
+    if counter >= patience:
+
+        print("Early stopping triggered")
+
+        break
+
+
+########################################################
+
+
+
