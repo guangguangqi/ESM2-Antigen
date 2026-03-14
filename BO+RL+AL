@@ -1,0 +1,431 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+import numpy as np
+
+############################################
+# 1 Amino acid utilities
+############################################
+
+AA = list("ACDEFGHIKLMNPQRSTVWY")
+
+def mutate_sequence(seq):
+    pos = random.randint(0, len(seq)-1)
+    new_res = random.choice(AA)
+    return seq[:pos] + new_res + seq[pos+1:]
+
+
+############################################
+# 2 Frozen ESM embedding (mock version)
+############################################
+
+class FrozenESMEmbedder:
+    """
+    Simulates frozen protein language model embeddings.
+    In practice this would call ESM forward pass once
+    and cache embeddings.
+    """
+
+    def __init__(self, dim=256):
+        self.dim = dim
+
+    def embed(self, seq):
+        np.random.seed(hash(seq) % (2**32))
+        return torch.tensor(np.random.randn(len(seq), self.dim)).float()
+
+
+############################################
+# 3 Graph builder (simplified)
+############################################
+
+def build_graph(embedding):
+
+    """
+    For simplicity we treat sequence positions as nodes
+    and average them later.
+    """
+
+    return embedding
+
+
+############################################
+# 4 GNN affinity predictor with MC Dropout
+############################################
+
+class AffinityGNN(nn.Module):
+
+    def __init__(self, node_dim=256, hidden=128):
+
+        super().__init__()
+
+        self.fc1 = nn.Linear(node_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+
+        self.dropout = nn.Dropout(0.2)
+
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+
+        x = torch.mean(x, dim=0)
+
+        return self.out(x)
+
+
+############################################
+# 5 MC Dropout prediction
+############################################
+
+def mc_dropout_predict(model, graph, n_samples=30):
+
+    model.train()  # keep dropout active
+
+    preds = []
+
+    for _ in range(n_samples):
+        preds.append(model(graph))
+
+    preds = torch.stack(preds)
+
+    mean = preds.mean()
+    std = preds.std()
+
+    return mean.item(), std.item()
+
+
+############################################
+# 6 Bayesian Optimization (Expected Improvement)
+############################################
+
+def expected_improvement(mean, std, best, xi=0.01):
+
+    improvement = mean - best - xi
+
+    z = improvement / (std + 1e-8)
+
+    ei = improvement * torch.distributions.Normal(0,1).cdf(torch.tensor(z)) + \
+         std * torch.distributions.Normal(0,1).log_prob(torch.tensor(z)).exp()
+
+    return ei.item()
+
+
+def bo_select(model, candidates, embedder, best_score, top_k=10):
+
+    scores = []
+
+    for seq in candidates:
+
+        emb = embedder.embed(seq)
+        graph = build_graph(emb)
+
+        mean, std = mc_dropout_predict(model, graph)
+
+        score = expected_improvement(mean, std, best_score)
+
+        scores.append(score)
+
+    idx = np.argsort(scores)[::-1][:top_k]
+
+    return [candidates[i] for i in idx]
+
+
+############################################
+# 7 RL mutation optimization
+############################################
+
+def rl_optimize(model, seed_sequences, embedder, steps=50):
+
+    optimized = []
+
+    for seq in seed_sequences:
+
+        current = seq
+
+        emb = embedder.embed(current)
+        best_reward,_ = mc_dropout_predict(model, build_graph(emb))
+
+        for _ in range(steps):
+
+            candidate = mutate_sequence(current)
+
+            emb = embedder.embed(candidate)
+            graph = build_graph(emb)
+
+            reward,_ = mc_dropout_predict(model, graph)
+
+            if reward > best_reward:
+                current = candidate
+                best_reward = reward
+
+        optimized.append(current)
+
+    return optimized
+
+
+############################################
+# 8 Simulated evaluation function
+############################################
+
+def evaluate_sequences(seqs):
+
+    """
+    Simulates expensive experiment/docking
+    """
+
+    scores = []
+
+    for s in seqs:
+
+        np.random.seed(hash(s) % (2**32))
+
+        score = np.random.normal(0.5,0.1)
+
+        scores.append(score)
+
+    return scores
+
+
+############################################
+# 9 Training step
+############################################
+
+def train_model(model, dataset, embedder, optimizer, epochs=3):
+
+    model.train()
+
+    for _ in range(epochs):
+
+        for seq, label in dataset:
+
+            emb = embedder.embed(seq)
+
+            graph = build_graph(emb)
+
+            pred = model(graph)
+
+            loss = (pred - torch.tensor([label]))**2
+
+            optimizer.zero_grad()
+
+            loss.backward()
+
+            optimizer.step()
+
+
+############################################
+# 10 Candidate generator (simulated ESM)
+############################################
+
+def generate_candidates(seed="CARDRSTYW", n=100):
+
+    candidates = []
+
+    for _ in range(n):
+
+        seq = seed
+
+        for _ in range(random.randint(1,3)):
+            seq = mutate_sequence(seq)
+
+        candidates.append(seq)
+
+    return candidates
+
+
+############################################
+# 11 Main BO + RL + AL loop
+############################################
+
+def main():
+
+    embedder = FrozenESMEmbedder()
+
+    model = AffinityGNN()
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    dataset = []
+
+    best_score = -1e9
+
+    for iteration in range(10):
+
+        print(f"\nIteration {iteration}")
+
+        # candidate generation
+        candidates = generate_candidates()
+
+        # BO selection
+        seeds = bo_select(model, candidates, embedder, best_score)
+
+        print("BO seeds:", seeds)
+
+        # RL mutation
+        improved = rl_optimize(model, seeds, embedder)
+
+        print("RL optimized:", improved)
+
+        # expensive evaluation
+        labels = evaluate_sequences(improved)
+
+        # Active learning dataset update
+        for s,l in zip(improved,labels):
+
+            dataset.append((s,l))
+
+            best_score = max(best_score,l)
+
+        # retrain model
+        train_model(model, dataset, embedder, optimizer)
+
+        print("Dataset size:", len(dataset))
+
+
+if __name__ == "__main__":
+    main()
+
+
+##########################################################################
+###################################### update from google AI
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import random
+import numpy as np
+
+AA = list("ACDEFGHIKLMNPQRSTVWY")
+
+############################################
+# 1. Embedding Cache (Performance Optimization)
+############################################
+
+class EmbeddingCache:
+    """Caches pLM embeddings to avoid redundant forward passes."""
+    def __init__(self, dim=256):
+        self.cache = {}
+        self.dim = dim
+
+    def get(self, seq):
+        if seq not in self.cache:
+            # Simulated ESM embedding (Frozen)
+            # In production: replace with actual ESM model call
+            np.random.seed(hash(seq) % (2**32))
+            self.cache[seq] = torch.tensor(np.random.randn(len(seq), self.dim)).float()
+        return self.cache[seq]
+
+############################################
+# 2. Improved GNN with Attention Pooling
+############################################
+
+class ImprovedAffinityGNN(nn.Module):
+    def __init__(self, node_dim=256, hidden=128):
+        super().__init__()
+        self.fc1 = nn.Linear(node_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.dropout = nn.Dropout(0.2)
+        
+        # Attention pooling: learns which residues are most important for affinity
+        self.attention = nn.Linear(hidden, 1)
+        self.out = nn.Linear(hidden, 1)
+
+    def forward(self, x):
+        # x shape: (seq_len, node_dim)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = F.relu(self.fc2(x))
+        x = self.dropout(x)
+
+        # Softmax over sequence length to get weights
+        attn_weights = F.softmax(self.attention(x), dim=0)
+        # Weighted sum: (hidden,)
+        x = torch.sum(attn_weights * x, dim=0)
+
+        return self.out(x)
+
+############################################
+# 3. Enhanced Search & Training Logic
+############################################
+
+def mc_dropout_predict(model, embedding, n_samples=20):
+    model.train() # Keep dropout active for UQ
+    preds = torch.stack([model(embedding) for _ in range(n_samples)])
+    return preds.mean().item(), preds.std().item()
+
+def expected_improvement(mean, std, best, xi=0.01):
+    if std < 1e-7: return 0.0
+    improvement = mean - best - xi
+    z = improvement / std
+    norm = torch.distributions.Normal(0, 1)
+    ei = improvement * norm.cdf(torch.tensor(z)) + std * norm.log_prob(torch.tensor(z)).exp()
+    return ei.item()
+
+def train_model(model, dataset, cache, optimizer, epochs=10):
+    model.train()
+    if not dataset: return
+    
+    for _ in range(epochs):
+        # Shuffle dataset each epoch to improve generalization
+        random.shuffle(dataset)
+        for seq, label in dataset:
+            emb = cache.get(seq)
+            pred = model(emb)
+            loss = F.mse_loss(pred, torch.tensor([label], dtype=torch.float))
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+############################################
+# 4. Main Execution Loop
+############################################
+
+def mutate_sequence(seq):
+    pos = random.randint(0, len(seq)-1)
+    new_res = random.choice(AA)
+    return seq[:pos] + new_res + seq[pos+1:]
+
+def run_pipeline():
+    cache = EmbeddingCache()
+    model = ImprovedAffinityGNN()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    dataset = []
+    best_score = -1.0 # Initial baseline
+
+    # Active Learning Iterations
+    for iteration in range(5):
+        # 1. Generate & Select via BO (Expected Improvement)
+        candidates = [mutate_sequence("CARDRSTYW") for _ in range(50)]
+        scores = [expected_improvement(*mc_dropout_predict(model, cache.get(c)), best_score) for c in candidates]
+        seeds = [candidates[i] for i in np.argsort(scores)[-5:]]
+        
+        # 2. Local RL-style Optimization
+        improved_batch = []
+        for seq in seeds:
+            curr = seq
+            for _ in range(10):
+                cand = mutate_sequence(curr)
+                if mc_dropout_predict(model, cache.get(cand))[0] > mc_dropout_predict(model, cache.get(curr))[0]:
+                    curr = cand
+            improved_batch.append(curr)
+
+        # 3. Simulate Lab Evaluation (Oracle)
+        labels = [np.random.normal(0.6, 0.1) for _ in improved_batch]
+        
+        # 4. Update Dataset & Retrain
+        for s, l in zip(improved_batch, labels):
+            dataset.append((s, l))
+            best_score = max(best_score, l)
+        
+        train_model(model, dataset, cache, optimizer)
+        print(f"Iter {iteration} | Best Score: {best_score:.4f} | Data: {len(dataset)}")
+
+if __name__ == "__main__":
+    run_pipeline()
+
